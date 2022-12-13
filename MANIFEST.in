@@ -1,0 +1,5 @@
+include max3100_module.c
+include README.md
+include CHANGELOG.md
+include LICENSE
+include setup.py
