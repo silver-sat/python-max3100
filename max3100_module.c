@@ -34,6 +34,7 @@
 #include <linux/types.h>
 #include <sys/ioctl.h>
 #include <linux/ioctl.h>
+#include <sys/time.h>
 
 #define _VERSION_ "0.1"
 #define SPIDEV_MAXPATH 4096
@@ -57,7 +58,11 @@
 // Configuration.
 #define MAX3100_CONF_R              0b1000000000000000
 #define MAX3100_CONF_T              0b0100000000000000
-#define MAX3100_CONF_RM             0b0000010000000000
+#define MAX3100_CONF_RM             0b0000110000000000
+
+// Crystal
+#define MAX3100_CRYSTAL_1843kHz     1
+#define MAX3100_CRYSTAL_3686kHz     2
 
 // Baud rates for clock multiplier x1.
 #define MAX3100_CONF_BAUD_X1_115200 0b0000000000000000
@@ -82,6 +87,26 @@
 #define MAX3100_CONF_BAUD_X2_2400   0b0000000000001101
 #define MAX3100_CONF_BAUD_X2_1200   0b0000000000001110
 #define MAX3100_CONF_BAUD_X2_600    0b0000000000001111
+
+#define BYTE_TO_BINARY_PATTERN "%s %c%c%c%c%c%c%c%c %c%c%c%c%c%c%c%c\n"
+#define BYTE_TO_BINARY(byte)  \
+  (byte & 0x8000 ? '1' : '0'), \
+  (byte & 0x4000 ? '1' : '0'), \
+  (byte & 0x2000 ? '1' : '0'), \
+  (byte & 0x1000 ? '1' : '0'), \
+  (byte & 0x0800 ? '1' : '0'), \
+  (byte & 0x0400 ? '1' : '0'), \
+  (byte & 0x0200 ? '1' : '0'), \
+  (byte & 0x0100 ? '1' : '0'), \
+	(byte & 0x0080 ? '1' : '0'), \
+  (byte & 0x0040 ? '1' : '0'), \
+  (byte & 0x0020 ? '1' : '0'), \
+  (byte & 0x0010 ? '1' : '0'), \
+  (byte & 0x0008 ? '1' : '0'), \
+  (byte & 0x0004 ? '1' : '0'), \
+  (byte & 0x0002 ? '1' : '0'), \
+  (byte & 0x0001 ? '1' : '0')
+#define fprintf_binary(file, msg, value) fprintf(file, BYTE_TO_BINARY_PATTERN, msg, BYTE_TO_BINARY(value))
 
 #if PY_MAJOR_VERSION < 3
 #define PyLong_AS_LONG(val) PyInt_AS_LONG(val)
@@ -197,20 +222,101 @@ MAX3100_dealloc(MAX3100_Object *self)
 	Py_TYPE(self)->tp_free((PyObject *)self);
 }
 
+uint16_t swapbytes(uint16_t data) {
+	return ((data << 8) & 0xff00) | ((data >> 8) & 0x00ff);
+}
+
+void send16(int fd, uint16_t send) {
+	// fprintf_binary(stderr, "send", send);
+	send = swapbytes(send);
+  write(fd, &send, sizeof(uint16_t));
+}
+
+uint16_t recv16(int fd) {
+	uint16_t recv=0;
+	read(fd, &recv, sizeof(uint16_t));
+	recv = swapbytes(recv);
+	// fprintf_binary(stderr, "recv", recv);
+	return recv;
+}
+	
+uint16_t transfer16(MAX3100_Object *self, uint16_t send) {
+	uint16_t recv=0;
+	// fprintf_binary(stderr, "send", send);
+	send = swapbytes(send);
+	struct spi_ioc_transfer xfer;
+	memset(&xfer, 0, sizeof(xfer));
+  xfer.tx_buf = (unsigned long)&send;
+	xfer.rx_buf = (unsigned long)&recv;
+	xfer.len = 2;
+	xfer.delay_usecs = 0;
+	xfer.speed_hz = self->max_speed_hz;
+	xfer.bits_per_word = self->bits_per_word;
+	int status = ioctl(self->fd, SPI_IOC_MESSAGE(1), &xfer);
+	recv = swapbytes(recv);
+	// fprintf_binary(stderr, "recv", recv);
+	return recv;
+}
+
+uint8_t readbyte(MAX3100_Object *self, uint8_t *ch) {
+  uint16_t r = transfer16(self, MAX3100_CMD_READ_DATA);
+  if (r&MAX3100_CONF_R) {
+     (*ch) = (uint8_t)(r&0xff);
+		 return (uint8_t)1;
+	} else {
+    return (uint8_t)0;
+  }
+}
+
+uint16_t ready(MAX3100_Object *self) {
+	uint16_t r = transfer16(self, MAX3100_CMD_READ_CONF);
+  return (r&MAX3100_CONF_R);
+}
+
+uint16_t busy(MAX3100_Object *self) {
+	uint16_t r = transfer16(self, MAX3100_CMD_READ_CONF);
+	// fprintf_binary(stderr, "busy", r&MAX3100_CONF_T);
+	return (!(r&MAX3100_CONF_T));
+}
+
+void writebyte(MAX3100_Object *self, uint8_t uch) {
+	while (1) {
+	  if (!busy(self)) {
+			transfer16(self,MAX3100_CMD_WRITE_DATA|uch);
+			break;
+		}
+	}
+}
+
+void then(struct timeval *tv, int usec) {
+	struct timeval tv0, tv1;
+	gettimeofday(&tv0,NULL);
+	tv1.tv_sec = usec/1000000;
+	tv1.tv_usec = usec%1000000;
+	timeradd(&tv0,&tv1,tv);
+}
+
+int stopnow(struct timeval *stoptime) {
+	struct timeval tv;
+	gettimeofday(&tv,NULL);
+	return (timercmp(&tv,stoptime,>));
+}
+
 static char *wrmsg_list0 = "Empty argument list.";
 static char *wrmsg_listmax = "Argument list size exceeds %d bytes.";
 static char *wrmsg_val = "Non-Int/Long value in arguments: %x.";
-static char *wrmsg_oom = "Out of memory.";
-
+// static char *wrmsg_oom = "Out of memory.";
+static char *wrmsg_timeout = "Timeout.";
 
 PyDoc_STRVAR(MAX3100_write_doc,
 	"write([values]) -> None\n\n"
 	"Write bytes to SPI device.\n");
 
+
+
 static PyObject *
 MAX3100_writebytes(MAX3100_Object *self, PyObject *args)
 {
-	int		status;
 	uint16_t	ii, len;
 	uint8_t	buf[SPIDEV_MAXPATH];
 	PyObject	*obj;
@@ -233,8 +339,12 @@ MAX3100_writebytes(MAX3100_Object *self, PyObject *args)
 		return NULL;
 	}
 
+  // fprintf(stderr, "length: %d\n", len);
 	for (ii = 0; ii < len; ii++) {
 		PyObject *val = PySequence_Fast_GET_ITEM(seq, ii);
+		// PyObject_Print((PyObject *)Py_TYPE(val), stderr, 0);
+		// fprintf(stderr, "\n");
+		// fprintf(stderr, "%d\n",PyLong_Check(val));
 #if PY_MAJOR_VERSION < 3
 		if (PyInt_Check(val)) {
 			buf[ii] = (__u8)PyInt_AS_LONG(val);
@@ -253,680 +363,78 @@ MAX3100_writebytes(MAX3100_Object *self, PyObject *args)
 
 	Py_DECREF(seq);
 
-	status = write(self->fd, &buf[0], len);
-
-	if (status < 0) {
-		PyErr_SetFromErrno(PyExc_IOError);
-		return NULL;
+  for (int ii=0; ii<len; ii++) {
+		writebyte(self, buf[ii]);
 	}
-
-	if (status != len) {
-		perror("short write");
-		return NULL;
-	}
-
+	
 	Py_INCREF(Py_None);
 	return Py_None;
 }
 
 PyDoc_STRVAR(MAX3100_read_doc,
-	"read(len) -> [values]\n\n"
-	"Read len bytes from SPI device.\n");
+	"read(length=1,timeout=None) -> [values]\n\n"
+	"Read len bytes from SPI device. timeout in seconds\n");
 
 static PyObject *
-MAX3100_readbytes(MAX3100_Object *self, PyObject *args)
+MAX3100_readbytes(MAX3100_Object *self, PyObject *args, PyObject *kwds)
 {
 	uint8_t	rxbuf[SPIDEV_MAXPATH];
-	int		status, len, ii;
+	int	ii;
+	int len=1;
+	int timeout=INT_MAX; 
+	float toflt=1;
+	
 	PyObject	*list;
-
-	if (!PyArg_ParseTuple(args, "i:read", &len))
+  static char *kwlist[] = {"length", "timeout", NULL};
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "|if:read", kwlist, 
+	                                 &len, &toflt))
 		return NULL;
-
+  // fprintf(stderr, "length: %d\n", len);
+	// fprintf(stderr, "timeout: %d\n", timeout);
+	if (toflt > 0) {
+	  timeout=1000000*toflt;
+	}
+	
 	/* read at least 1 byte, no more than SPIDEV_MAXPATH */
 	if (len < 1)
 		len = 1;
 	else if ((unsigned)len > sizeof(rxbuf))
 		len = sizeof(rxbuf);
 
+  int len1=0;
 	memset(rxbuf, 0, sizeof rxbuf);
-	status = read(self->fd, &rxbuf[0], len);
-
-	if (status < 0) {
-		PyErr_SetFromErrno(PyExc_IOError);
-		return NULL;
-	}
-
-	if (status != len) {
-		perror("short read");
-		return NULL;
-	}
-
-	list = PyList_New(len);
-
+	struct timeval stoptime;
+	then(&stoptime,timeout);
+	int stop = 0;
 	for (ii = 0; ii < len; ii++) {
+		while (!readbyte(self, &(rxbuf[ii]))) {
+			 stop = stopnow(&stoptime);
+			 if (stop) {
+			   break;
+			 }
+		}
+		if (stop) {
+			// fprintf(stderr, "STOP\n");
+			break;
+		}
+		// fprintf(stderr, "  %d %c\n", ii, rxbuf[ii]);
+		len1++;
+		then(&stoptime,timeout);
+	}
+	// fprintf(stderr, "len1: %d\n", len1);
+	// if (stop || (len1 < len)) {
+	// 	PyErr_SetString(PyExc_ValueError, wrmsg_timeout);
+	// 	return NULL;
+	// }
+	
+	list = PyList_New(len1);
+
+	for (ii = 0; ii < len1; ii++) {
 		PyObject *val = PyLong_FromLong((long)rxbuf[ii]);
 		PyList_SET_ITEM(list, ii, val);  // Steals reference, no need to Py_DECREF(val)
 	}
 
 	return list;
-}
-
-static PyObject *
-MAX3100_writebytes2_buffer(MAX3100_Object *self, Py_buffer *buffer)
-{
-	int		status;
-	Py_ssize_t	remain, block_size, block_start, spi_max_block;
-
-	spi_max_block = get_xfer3_block_size();
-
-	block_start = 0;
-	remain = buffer->len;
-	while (block_start < buffer->len) {
-		block_size = (remain < spi_max_block) ? remain : spi_max_block;
-
-		Py_BEGIN_ALLOW_THREADS
-		status = write(self->fd, buffer->buf + block_start, block_size);
-		Py_END_ALLOW_THREADS
-
-		if (status < 0) {
-			PyErr_SetFromErrno(PyExc_IOError);
-			return NULL;
-		}
-
-		if (status != block_size) {
-			perror("short write");
-			return NULL;
-		}
-
-		block_start += block_size;
-		remain -= block_size;
-	}
-
-	Py_INCREF(Py_None);
-	return Py_None;
-}
-
-static PyObject *
-MAX3100_writebytes2_seq_internal(MAX3100_Object *self, PyObject *seq, Py_ssize_t len, uint8_t *buf, Py_ssize_t bufsize)
-{
-	int		status;
-	Py_ssize_t	ii, jj, remain, block_size;
-	char	wrmsg_text[4096];
-
-	remain = len;
-	jj = 0;
-	while (remain > 0) {
-		block_size = (remain < bufsize) ? remain : bufsize;
-
-		for (ii = 0; ii < block_size; ii++, jj++) {
-			PyObject *val = PySequence_Fast_GET_ITEM(seq, jj);
-#if PY_MAJOR_VERSION < 3
-			if (PyInt_Check(val)) {
-				buf[ii] = (__u8)PyInt_AS_LONG(val);
-			} else
-#endif
-			{
-				if (PyLong_Check(val)) {
-					buf[ii] = (__u8)PyLong_AS_LONG(val);
-				} else {
-					snprintf(wrmsg_text, sizeof (wrmsg_text) - 1, wrmsg_val, val);
-					PyErr_SetString(PyExc_TypeError, wrmsg_text);
-					return NULL;
-				}
-			}
-		}
-
-		Py_BEGIN_ALLOW_THREADS
-		status = write(self->fd, buf, block_size);
-		Py_END_ALLOW_THREADS
-
-		if (status < 0) {
-			PyErr_SetFromErrno(PyExc_IOError);
-			return NULL;
-		}
-
-		if (status != block_size) {
-			perror("short write");
-			return NULL;
-		}
-
-		remain -= block_size;
-	}
-
-	Py_INCREF(Py_None);
-	return Py_None;
-}
-
-// In writebytes2 we try to avoild doing malloc/free on each tiny block.
-// So for any transfer below this size we will use on-stack local buffer instead of allocating one on the heap.
-#define SMALL_BUFFER_SIZE 128
-
-static PyObject *
-MAX3100_writebytes2_seq(MAX3100_Object *self, PyObject *seq)
-{
-	Py_ssize_t	len, bufsize, spi_max_block;
-	PyObject	*result = NULL;
-
-	len = PySequence_Fast_GET_SIZE(seq);
-	if (len <= 0) {
-		PyErr_SetString(PyExc_TypeError, wrmsg_list0);
-		return NULL;
-	}
-
-	spi_max_block = get_xfer3_block_size();
-
-	bufsize = (len < spi_max_block) ? len : spi_max_block;
-
-	if (bufsize <= SMALL_BUFFER_SIZE) {
-		// The data size is very small so we can avoid malloc/free completely
-		// by using a small local buffer instead
-		uint8_t buf[SMALL_BUFFER_SIZE];
-		result = MAX3100_writebytes2_seq_internal(self, seq, len, buf, SMALL_BUFFER_SIZE);
-	} else {
-		// Large data, need to allocate buffer on heap
-		uint8_t	*buf;
-		Py_BEGIN_ALLOW_THREADS
-		buf = malloc(sizeof(__u8) * bufsize);
-		Py_END_ALLOW_THREADS
-
-		if (!buf) {
-			PyErr_SetString(PyExc_OverflowError, wrmsg_oom);
-			return NULL;
-		}
-
-		result = MAX3100_writebytes2_seq_internal(self, seq, len, buf, bufsize);
-
-		Py_BEGIN_ALLOW_THREADS
-		free(buf);
-		Py_END_ALLOW_THREADS
-	}
-
-	return result;
-}
-
-PyDoc_STRVAR(MAX3100_writebytes2_doc,
-	"writebytes2([values]) -> None\n\n"
-	"Write bytes to SPI device.\n"
-	"values must be a list or buffer.\n");
-
-static PyObject *
-MAX3100_writebytes2(MAX3100_Object *self, PyObject *args)
-{
-	PyObject	*obj, *seq;;
-	PyObject	*result = NULL;
-
-	if (!PyArg_ParseTuple(args, "O:writebytes2", &obj)) {
-		return NULL;
-	}
-
-	// Try using buffer protocol if object supports it.
-	if (PyObject_CheckBuffer(obj) && 1) {
-		Py_buffer	buffer;
-		if (PyObject_GetBuffer(obj, &buffer, PyBUF_SIMPLE) != -1) {
-			result = MAX3100_writebytes2_buffer(self, &buffer);
-			PyBuffer_Release(&buffer);
-			return result;
-		}
-	}
-
-
-	// Otherwise, fall back to sequence protocol
-	seq = PySequence_Fast(obj, "expected a sequence");
-	if (seq == NULL) {
-		PyErr_SetString(PyExc_TypeError, wrmsg_list0);
-		return NULL;
-	}
-
-	result = MAX3100_writebytes2_seq(self, seq);
-
-	Py_DECREF(seq);
-
-	return result;
-
-}
-
-PyDoc_STRVAR(MAX3100_xfer_doc,
-	"xfer([values]) -> [values]\n\n"
-	"Perform SPI transaction.\n"
-	"CS will be released and reactivated between blocks.\n"
-	"delay specifies delay in usec between blocks.\n");
-
-static PyObject *
-MAX3100_xfer(MAX3100_Object *self, PyObject *args)
-{
-	uint16_t ii, len;
-	int status;
-	uint16_t delay_usecs = 0;
-	uint32_t speed_hz = 0;
-	uint8_t bits_per_word = 0;
-	PyObject *obj;
-	PyObject *seq;
-#ifdef SPIDEV_SINGLE
-	struct spi_ioc_transfer *xferptr;
-	memset(&xferptr, 0, sizeof(xferptr));
-#else
-	struct spi_ioc_transfer xfer;
-	memset(&xfer, 0, sizeof(xfer));
-#endif
-	uint8_t *txbuf, *rxbuf;
-	char	wrmsg_text[4096];
-
-	if (!PyArg_ParseTuple(args, "O|IHB:xfer", &obj, &speed_hz, &delay_usecs, &bits_per_word))
-		return NULL;
-
-	seq = PySequence_Fast(obj, "expected a sequence");
-	if (!seq) {
-		PyErr_SetString(PyExc_TypeError, wrmsg_list0);
-		return NULL;
-	}
-
-	len = PySequence_Fast_GET_SIZE(seq);
-	if (len <= 0) {
-		Py_DECREF(seq);
-		PyErr_SetString(PyExc_TypeError, wrmsg_list0);
-		return NULL;
-	}
-
-	if (len > SPIDEV_MAXPATH) {
-		snprintf(wrmsg_text, sizeof(wrmsg_text) - 1, wrmsg_listmax, SPIDEV_MAXPATH);
-		PyErr_SetString(PyExc_OverflowError, wrmsg_text);
-		Py_DECREF(seq);
-		return NULL;
-	}
-
-	txbuf = malloc(sizeof(__u8) * len);
-	rxbuf = malloc(sizeof(__u8) * len);
-
-#ifdef SPIDEV_SINGLE
-	xferptr = (struct spi_ioc_transfer*) malloc(sizeof(struct spi_ioc_transfer) * len);
-
-	for (ii = 0; ii < len; ii++) {
-		PyObject *val = PySequence_Fast_GET_ITEM(seq, ii);
-#if PY_MAJOR_VERSION < 3
-		if (PyInt_Check(val)) {
-			txbuf[ii] = (__u8)PyInt_AS_LONG(val);
-		} else
-#endif
-		{
-			if (PyLong_Check(val)) {
-				txbuf[ii] = (__u8)PyLong_AS_LONG(val);
-			} else {
-				snprintf(wrmsg_text, sizeof(wrmsg_text) - 1, wrmsg_val, val);
-				PyErr_SetString(PyExc_TypeError, wrmsg_text);
-				free(xferptr);
-				free(txbuf);
-				free(rxbuf);
-				Py_DECREF(seq);
-				return NULL;
-			}
-		}
-		xferptr[ii].tx_buf = (unsigned long)&txbuf[ii];
-		xferptr[ii].rx_buf = (unsigned long)&rxbuf[ii];
-		xferptr[ii].len = 1;
-		xferptr[ii].delay_usecs = delay;
-		xferptr[ii].speed_hz = speed_hz ? speed_hz : self->max_speed_hz;
-		xferptr[ii].bits_per_word = bits_per_word ? bits_per_word : self->bits_per_word;
-#ifdef SPI_IOC_WR_MODE32
-		xferptr[ii].tx_nbits = 0;
-#endif
-#ifdef SPI_IOC_RD_MODE32
-		xferptr[ii].rx_nbits = 0;
-#endif
-	}
-
-	status = ioctl(self->fd, SPI_IOC_MESSAGE(len), xferptr);
-	free(xferptr);
-	if (status < 0) {
-		PyErr_SetFromErrno(PyExc_IOError);
-		free(txbuf);
-		free(rxbuf);
-		Py_DECREF(seq);
-		return NULL;
-	}
-#else
-	for (ii = 0; ii < len; ii++) {
-		PyObject *val = PySequence_Fast_GET_ITEM(seq, ii);
-#if PY_MAJOR_VERSION < 3
-		if (PyInt_Check(val)) {
-			txbuf[ii] = (__u8)PyInt_AS_LONG(val);
-		} else
-#endif
-		{
-			if (PyLong_Check(val)) {
-				txbuf[ii] = (__u8)PyLong_AS_LONG(val);
-			} else {
-				snprintf(wrmsg_text, sizeof(wrmsg_text) - 1, wrmsg_val, val);
-				PyErr_SetString(PyExc_TypeError, wrmsg_text);
-				free(txbuf);
-				free(rxbuf);
-				Py_DECREF(seq);
-				return NULL;
-			}
-		}
-	}
-
-	if (PyTuple_Check(obj)) {
-		Py_DECREF(seq);
-		seq = PySequence_List(obj);
-	}
-
-	xfer.tx_buf = (unsigned long)txbuf;
-	xfer.rx_buf = (unsigned long)rxbuf;
-	xfer.len = len;
-	xfer.delay_usecs = delay_usecs;
-	xfer.speed_hz = speed_hz ? speed_hz : self->max_speed_hz;
-	xfer.bits_per_word = bits_per_word ? bits_per_word : self->bits_per_word;
-#ifdef SPI_IOC_WR_MODE32
-	xfer.tx_nbits = 0;
-#endif
-#ifdef SPI_IOC_RD_MODE32
-	xfer.rx_nbits = 0;
-#endif
-
-	status = ioctl(self->fd, SPI_IOC_MESSAGE(1), &xfer);
-	if (status < 0) {
-		PyErr_SetFromErrno(PyExc_IOError);
-		free(txbuf);
-		free(rxbuf);
-		Py_DECREF(seq);
-		return NULL;
-	}
-#endif
-
-	for (ii = 0; ii < len; ii++) {
-		PyObject *val = PyLong_FromLong((long)rxbuf[ii]);
-		PySequence_SetItem(seq, ii, val);
-		Py_DECREF(val); // PySequence_SetItem does not steal reference, must Py_DECREF(val)
-	}
-
-	// WA:
-	// in CS_HIGH mode CS isn't pulled to low after transfer, but after read
-	// reading 0 bytes doesnt matter but brings cs down
-	// tomdean:
-	// Stop generating an extra CS except in mode CS_HOGH
-	if (self->read0 && (self->mode & SPI_CS_HIGH)) status = read(self->fd, &rxbuf[0], 0);
-
-	free(txbuf);
-	free(rxbuf);
-
-	if (PyTuple_Check(obj)) {
-		PyObject *old = seq;
-		seq = PySequence_Tuple(seq);
-		Py_DECREF(old);
-	}
-
-	return seq;
-}
-
-
-PyDoc_STRVAR(MAX3100_xfer2_doc,
-	"xfer2([values]) -> [values]\n\n"
-	"Perform SPI transaction.\n"
-	"CS will be held active between blocks.\n");
-
-static PyObject *
-MAX3100_xfer2(MAX3100_Object *self, PyObject *args)
-{
-	int status;
-	uint16_t delay_usecs = 0;
-	uint32_t speed_hz = 0;
-	uint8_t bits_per_word = 0;
-	uint16_t ii, len;
-	PyObject *obj;
-	PyObject *seq;
-	struct spi_ioc_transfer xfer;
-	Py_BEGIN_ALLOW_THREADS
-	memset(&xfer, 0, sizeof(xfer));
-	Py_END_ALLOW_THREADS
-	uint8_t *txbuf, *rxbuf;
-	char	wrmsg_text[4096];
-
-	if (!PyArg_ParseTuple(args, "O|IHB:xfer2", &obj, &speed_hz, &delay_usecs, &bits_per_word))
-		return NULL;
-
-	seq = PySequence_Fast(obj, "expected a sequence");
-	if (!seq) {
-		PyErr_SetString(PyExc_TypeError, wrmsg_list0);
-		return NULL;
-	}
-
-	len = PySequence_Fast_GET_SIZE(seq);
-	if (len <= 0) {
-		Py_DECREF(seq);
-		PyErr_SetString(PyExc_TypeError, wrmsg_list0);
-		return NULL;
-	}
-
-	if (len > SPIDEV_MAXPATH) {
-		snprintf(wrmsg_text, sizeof(wrmsg_text) - 1, wrmsg_listmax, SPIDEV_MAXPATH);
-		PyErr_SetString(PyExc_OverflowError, wrmsg_text);
-		Py_DECREF(seq);
-		return NULL;
-	}
-
-	Py_BEGIN_ALLOW_THREADS
-	txbuf = malloc(sizeof(__u8) * len);
-	rxbuf = malloc(sizeof(__u8) * len);
-	Py_END_ALLOW_THREADS
-
-	for (ii = 0; ii < len; ii++) {
-		PyObject *val = PySequence_Fast_GET_ITEM(seq, ii);
-#if PY_MAJOR_VERSION < 3
-		if (PyInt_Check(val)) {
-			txbuf[ii] = (__u8)PyInt_AS_LONG(val);
-		} else
-#endif
-		{
-			if (PyLong_Check(val)) {
-				txbuf[ii] = (__u8)PyLong_AS_LONG(val);
-			} else {
-				snprintf(wrmsg_text, sizeof (wrmsg_text) - 1, wrmsg_val, val);
-				PyErr_SetString(PyExc_TypeError, wrmsg_text);
-				free(txbuf);
-				free(rxbuf);
-				Py_DECREF(seq);
-				return NULL;
-			}
-		}
-	}
-
-	if (PyTuple_Check(obj)) {
-		Py_DECREF(seq);
-		seq = PySequence_List(obj);
-	}
-
-	Py_BEGIN_ALLOW_THREADS
-	xfer.tx_buf = (unsigned long)txbuf;
-	xfer.rx_buf = (unsigned long)rxbuf;
-	xfer.len = len;
-	xfer.delay_usecs = delay_usecs;
-	xfer.speed_hz = speed_hz ? speed_hz : self->max_speed_hz;
-	xfer.bits_per_word = bits_per_word ? bits_per_word : self->bits_per_word;
-
-	status = ioctl(self->fd, SPI_IOC_MESSAGE(1), &xfer);
-	Py_END_ALLOW_THREADS
-	if (status < 0) {
-		PyErr_SetFromErrno(PyExc_IOError);
-		free(txbuf);
-		free(rxbuf);
-		Py_DECREF(seq);
-		return NULL;
-	}
-
-	for (ii = 0; ii < len; ii++) {
-		PyObject *val = PyLong_FromLong((long)rxbuf[ii]);
-		PySequence_SetItem(seq, ii, val);
-		Py_DECREF(val); // PySequence_SetItem does not steal reference, must Py_DECREF(val)
-	}
-	// WA:
-	// in CS_HIGH mode CS isnt pulled to low after transfer
-	// reading 0 bytes doesn't really matter but brings CS down
-	// tomdean:
-	// Stop generating an extra CS except in mode CS_HOGH
-	if (self->read0 && (self->mode & SPI_CS_HIGH)) status = read(self->fd, &rxbuf[0], 0);
-
-	Py_BEGIN_ALLOW_THREADS
-	free(txbuf);
-	free(rxbuf);
-	Py_END_ALLOW_THREADS
-
-
-	if (PyTuple_Check(obj)) {
-		PyObject *old = seq;
-		seq = PySequence_Tuple(seq);
-		Py_DECREF(old);
-	}
-
-	return seq;
-}
-
-PyDoc_STRVAR(MAX3100_xfer3_doc,
-	"xfer3([values]) -> [values]\n\n"
-	"Perform SPI transaction. Accepts input of arbitrary size.\n"
-	"Large blocks will be send as multiple transactions\n"
-	"CS will be held active between blocks.\n");
-
-static PyObject *
-MAX3100_xfer3(MAX3100_Object *self, PyObject *args)
-{
-	int status;
-	uint16_t delay_usecs = 0;
-	uint32_t speed_hz = 0;
-	uint8_t bits_per_word = 0;
-	Py_ssize_t ii, jj, len, block_size, block_start, bufsize;
-	PyObject *obj;
-	PyObject *seq;
-	PyObject *rx_tuple;
-	struct spi_ioc_transfer xfer;
-	Py_BEGIN_ALLOW_THREADS
-	memset(&xfer, 0, sizeof(xfer));
-	Py_END_ALLOW_THREADS
-	uint8_t *txbuf, *rxbuf;
-	char	wrmsg_text[4096];
-
-	if (!PyArg_ParseTuple(args, "O|IHB:xfer3", &obj, &speed_hz, &delay_usecs, &bits_per_word))
-		return NULL;
-
-	seq = PySequence_Fast(obj, "expected a sequence");
-	if (!seq) {
-		PyErr_SetString(PyExc_TypeError, wrmsg_list0);
-		return NULL;
-	}
-
-	len = PySequence_Fast_GET_SIZE(seq);
-	if (len <= 0) {
-		Py_DECREF(seq);
-		PyErr_SetString(PyExc_TypeError, wrmsg_list0);
-		return NULL;
-	}
-
-	bufsize = get_xfer3_block_size();
-	if (bufsize > len) {
-		bufsize = len;
-	}
-
-	rx_tuple = PyTuple_New(len);
-	if (!rx_tuple) {
-		Py_DECREF(seq);
-		PyErr_SetString(PyExc_OverflowError, wrmsg_oom);
-		return NULL;
-	}
-
-	Py_BEGIN_ALLOW_THREADS
-	// Allocate tx and rx buffers immediately releasing them if any allocation fails
-	if ((txbuf = malloc(sizeof(__u8) * bufsize)) != NULL) {
-		if ((rxbuf = malloc(sizeof(__u8) * bufsize)) != NULL) {
-			// All good, both buffers allocated
-		} else {
-			// rxbuf allocation failed while txbuf succeeded
-			free(txbuf);
-			txbuf = NULL;
-		}
-	} else {
-		// txbuf allocation failed
-		rxbuf = NULL;
-	}
-	Py_END_ALLOW_THREADS
-	if (!txbuf || !rxbuf) {
-		// Allocation failed. Buffers has been freed already
-		Py_DECREF(seq);
-		Py_DECREF(rx_tuple);
-		PyErr_SetString(PyExc_OverflowError, wrmsg_oom);
-		return NULL;
-	}
-
-
-	block_start = 0;
-	while (block_start < len) {
-
-		for (ii = 0, jj = block_start; jj < len && ii < bufsize; ii++, jj++) {
-			PyObject *val = PySequence_Fast_GET_ITEM(seq, jj);
-#if PY_MAJOR_VERSION < 3
-			if (PyInt_Check(val)) {
-				txbuf[ii] = (__u8)PyInt_AS_LONG(val);
-			} else
-#endif
-			{
-				if (PyLong_Check(val)) {
-					txbuf[ii] = (__u8)PyLong_AS_LONG(val);
-				} else {
-					snprintf(wrmsg_text, sizeof (wrmsg_text) - 1, wrmsg_val, val);
-					PyErr_SetString(PyExc_TypeError, wrmsg_text);
-					free(txbuf);
-					free(rxbuf);
-					Py_DECREF(rx_tuple);
-					Py_DECREF(seq);
-					return NULL;
-				}
-			}
-		}
-
-		block_size = ii;
-
-		Py_BEGIN_ALLOW_THREADS
-		xfer.tx_buf = (unsigned long)txbuf;
-		xfer.rx_buf = (unsigned long)rxbuf;
-		xfer.len = block_size;
-		xfer.delay_usecs = delay_usecs;
-		xfer.speed_hz = speed_hz ? speed_hz : self->max_speed_hz;
-		xfer.bits_per_word = bits_per_word ? bits_per_word : self->bits_per_word;
-
-		status = ioctl(self->fd, SPI_IOC_MESSAGE(1), &xfer);
-		Py_END_ALLOW_THREADS
-
-		if (status < 0) {
-			PyErr_SetFromErrno(PyExc_IOError);
-			free(txbuf);
-			free(rxbuf);
-			Py_DECREF(rx_tuple);
-			Py_DECREF(seq);
-			return NULL;
-		}
-		for (ii = 0, jj = block_start; ii < block_size; ii++, jj++) {
-			PyObject *val = PyLong_FromLong((long)rxbuf[ii]);
-			PyTuple_SetItem(rx_tuple, jj, val);  // Steals reference, no need to Py_DECREF(val)
-		}
-
-		block_start += block_size;
-	}
-
-
-	// WA:
-	// in CS_HIGH mode CS isnt pulled to low after transfer
-	// reading 0 bytes doesn't really matter but brings CS down
-	// tomdean:
-	// Stop generating an extra CS except in mode CS_HIGH
-	if (self->read0 && (self->mode & SPI_CS_HIGH)) status = read(self->fd, &rxbuf[0], 0);
-
-	Py_BEGIN_ALLOW_THREADS
-	free(txbuf);
-	free(rxbuf);
-	Py_END_ALLOW_THREADS
-
-	Py_DECREF(seq);
-
-	return rx_tuple;
 }
 
 PyDoc_STRVAR(MAX3100_fileno_doc,
@@ -942,44 +450,54 @@ MAX3100_fileno(MAX3100_Object *self)
 }
 
 PyDoc_STRVAR(MAX3100_open_doc,
-	"open(bus, device, crystal, baud)\n\n"
+	"open(bus=0, device=0, crystal=2, baud=9600, spispeed=7800000)\n\n"
 	"Connects the object to the specified SPI device.\n"
 	"open(X,Y,...) will open /dev/spidev<X>.<Y>\n");
 
 static PyObject *
 MAX3100_open(MAX3100_Object *self, PyObject *args, PyObject *kwds)
 {
-	int bus, device, crystal, baud;
+	int bus=0;
+	int device=0;
+	int crystal=2;
+	int baud=9600;
+	int spispeed = 3900000;
 	char path[SPIDEV_MAXPATH];
 	uint8_t tmp8;
-	uint32_t tmp32;
-	static char *kwlist[] = {"bus", "device", "crystal", "baud", NULL};
-	if (!PyArg_ParseTupleAndKeywords(args, kwds, "iiii:open", kwlist, &bus, &device, &crystal, &baud))
+	//uint32_t tmp32;
+	static char *kwlist[] = {"bus", "device", "crystal", "baud", "spispeed", NULL};
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "|iiiii:open", kwlist, 
+	                                 &bus, &device, &crystal, &baud, &spispeed))
 		return NULL;
 	if (snprintf(path, SPIDEV_MAXPATH, "/dev/spidev%d.%d", bus, device) >= SPIDEV_MAXPATH) {
 		PyErr_SetString(PyExc_OverflowError,
 			"Bus and/or device number is invalid.");
 		return NULL;
 	}
-  if ((self->fd = open(path, O_RDWR, 0)) == -1) {
+  
+	if ((self->fd = open(path, O_RDWR, 0)) == -1) {
 		PyErr_SetFromErrno(PyExc_IOError);
 		return NULL;
 	}
+	
 	if (ioctl(self->fd, SPI_IOC_RD_MODE, &tmp8) == -1) {
 		PyErr_SetFromErrno(PyExc_IOError);
 		return NULL;
 	}
 	self->mode = tmp8;
+	
 	if (ioctl(self->fd, SPI_IOC_RD_BITS_PER_WORD, &tmp8) == -1) {
 		PyErr_SetFromErrno(PyExc_IOError);
 		return NULL;
 	}
 	self->bits_per_word = tmp8;
-	if (ioctl(self->fd, SPI_IOC_RD_MAX_SPEED_HZ, &tmp32) == -1) {
+	
+	uint32_t spispeed_ = spispeed;
+	if (ioctl(self->fd, SPI_IOC_WR_MAX_SPEED_HZ, &spispeed_) == -1) {
 		PyErr_SetFromErrno(PyExc_IOError);
 		return NULL;
 	}
-	self->max_speed_hz = tmp32;
+	self->max_speed_hz = spispeed_;
 
   uint16_t conf;
   if (crystal == 2)
@@ -1017,16 +535,10 @@ MAX3100_open(MAX3100_Object *self, PyObject *args, PyObject *kwds)
 
   // Do we want the MAX3100_CONF_RM? What does this mean for us?
   conf |= (MAX3100_CMD_WRITE_CONF | MAX3100_CONF_RM);
-  write(self->fd, &conf, sizeof(uint16_t));
-	// fprintf(stderr, "blah blah\n");
-
+  transfer16(self, conf);
+	
 	Py_INCREF(Py_None);
 	return Py_None;
-}
-
-void transfer16(int fd, uint16_t send, uint16_t *recv) {
-	write(fd, &send, sizeof(uint16_t));
-	read(fd, recv, sizeof(uint16_t));
 }
 
 static int
@@ -1036,10 +548,11 @@ MAX3100_init(MAX3100_Object *self, PyObject *args, PyObject *kwds)
 	int client = -1;
 	int crystal = -1;
 	int baud = -1;
-	static char *kwlist[] = {"bus", "client", "crystal", "baud", NULL};
+	int spispeed = -1;
+	static char *kwlist[] = {"bus", "client", "crystal", "baud", "spispeed", NULL};
 
-	if (!PyArg_ParseTupleAndKeywords(args, kwds, "|iiii:__init__",
-			kwlist, &bus, &client, &crystal, &baud))
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "|iiiii:__init__",
+			kwlist, &bus, &client, &crystal, &baud, &spispeed))
 		return -1;
 
 	if (bus >= 0) {
@@ -1053,7 +566,7 @@ MAX3100_init(MAX3100_Object *self, PyObject *args, PyObject *kwds)
 
 
 PyDoc_STRVAR(MAX3100_ObjectType_doc,
-	"MAX3100([bus],[client],[crystal],[baud]) -> Serial\n\n"
+	"MAX3100([bus],[client],[crystal],[baud],[spispeed]) -> Serial\n\n"
 	"Return a new MAX3100 object that is (optionally) connected to the\n"
 	"specified SPI device interface.\n");
 
@@ -1090,18 +603,10 @@ static PyMethodDef MAX3100_methods[] = {
 		MAX3100_close_doc},
 	{"fileno", (PyCFunction)MAX3100_fileno, METH_NOARGS,
 		MAX3100_fileno_doc},
-	{"readbytes", (PyCFunction)MAX3100_readbytes, METH_VARARGS,
+	{"read", (PyCFunction)MAX3100_readbytes, METH_VARARGS | METH_KEYWORDS,
 		MAX3100_read_doc},
-	{"writebytes", (PyCFunction)MAX3100_writebytes, METH_VARARGS,
+	{"write", (PyCFunction)MAX3100_writebytes, METH_VARARGS,
 		MAX3100_write_doc},
-	{"writebytes2", (PyCFunction)MAX3100_writebytes2, METH_VARARGS,
-		MAX3100_writebytes2_doc},
-	{"xfer", (PyCFunction)MAX3100_xfer, METH_VARARGS,
-		MAX3100_xfer_doc},
-	{"xfer2", (PyCFunction)MAX3100_xfer2, METH_VARARGS,
-		MAX3100_xfer2_doc},
-	{"xfer3", (PyCFunction)MAX3100_xfer3, METH_VARARGS,
-		MAX3100_xfer3_doc},
 	{"__enter__", (PyCFunction)MAX3100_enter, METH_VARARGS,
 		NULL},
 	{"__exit__", (PyCFunction)MAX3100_exit, METH_VARARGS,
