@@ -174,7 +174,14 @@ typedef struct {
 	uint8_t bits_per_word;	/* current SPI bits per word setting */
 	uint32_t max_speed_hz;	/* current SPI max speed setting in Hz */
 	uint8_t read0;	/* read 0 bytes after transfer to lwoer CS if SPI_CS_HIGH */
+	uint8_t maxmisses;
 } MAX3100_Object;
+
+#define BUFSIZE 2048
+uint8_t buffer[BUFSIZE];
+/* good read chars go from bufst ... (bufend-1), buffer is empty if bufend == bufst */
+uint32_t bufst=0;
+uint32_t bufend=0;
 
 static PyObject *
 MAX3100_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
@@ -256,6 +263,62 @@ uint16_t transfer16(MAX3100_Object *self, uint16_t send) {
 	recv = swapbytes(recv);
 	// fprintf_binary(stderr, "recv", recv);
 	return recv;
+}
+
+void fetchbytes(MAX3100_Object *self) {
+	uint16_t r;
+	misses = 0
+	while (misses < self->maxmisses) {
+		r = transfer16(self, MAX3100_CMD_READ_DATA);
+		if (r&MAX3100_CONF_R) {
+		  buffer[bufend] = (uint8_t)(r&0xff);
+		  bufend += 1
+		  if (bufend >= BUFSIZE) {
+		    bufend = 0;
+		  }
+			assert(bufend != bufst);
+			misses = 0;
+		} else {
+			misses += 1;
+		}
+	}
+}
+
+void putbyte(MAX3100_Object *self, uint8_t uch)) {
+	uint16_t r;
+	while (1) {
+		r = transfer16(self, MAX3100_CMD_READ_CONF);
+		if (r&MAX3100_CONF_R) {
+			fetchbytes(self);
+		} else if (r&MAX3100_CONF_T) {
+			break;
+		}
+	}
+	r = transfer16(self,MAX3100_CMD_WRITE_DATA|uch);
+	if (r&MAX3100_CONF_R) {
+	  buffer[bufend] = (uint8_t)(r&0xff);
+	  bufend += 1
+		if (bufend >= BUFSIZE) {
+		  bufend = 0;
+		}
+		assert(bufend != bufst);
+		fetchbytes(self);
+	}
+}
+
+uint8_t getbyte(MAX3100_Object *self, uint8_t &uch)) {
+	if (bufend == bufst) {
+		fetchbytes(self);
+	}
+	if (bufend != bufst) {
+		*uch = buffer[bufst]
+		bufst += 1
+		if (bufst >= BUFSIZE) {
+			bufst = 0;
+		}
+		return 1;
+	} 
+	return 0;
 }
 
 uint8_t readbyte(MAX3100_Object *self, uint8_t *ch) {
@@ -364,7 +427,7 @@ MAX3100_writebytes(MAX3100_Object *self, PyObject *args)
 	Py_DECREF(seq);
 
   for (int ii=0; ii<len; ii++) {
-		writebyte(self, buf[ii]);
+		putbyte(self, buf[ii]);
 	}
 	
 	Py_INCREF(Py_None);
@@ -372,7 +435,7 @@ MAX3100_writebytes(MAX3100_Object *self, PyObject *args)
 }
 
 PyDoc_STRVAR(MAX3100_read_doc,
-	"read(length=1,timeout=None) -> [values]\n\n"
+	"read(length=1) -> [values]\n\n"
 	"Read len bytes from SPI device. timeout in seconds\n");
 
 static PyObject *
@@ -381,19 +444,11 @@ MAX3100_readbytes(MAX3100_Object *self, PyObject *args, PyObject *kwds)
 	uint8_t	rxbuf[SPIDEV_MAXPATH];
 	int	ii;
 	int len=1;
-	int timeout=INT_MAX; 
-	float toflt=1;
 	
 	PyObject	*list;
-  static char *kwlist[] = {"length", "timeout", NULL};
-	if (!PyArg_ParseTupleAndKeywords(args, kwds, "|if:read", kwlist, 
-	                                 &len, &toflt))
+  static char *kwlist[] = {"length", NULL};
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "|i:read", kwlist, &len))
 		return NULL;
-  // fprintf(stderr, "length: %d\n", len);
-	// fprintf(stderr, "timeout: %d\n", timeout);
-	if (toflt > 0) {
-	  timeout=1000000*toflt;
-	}
 	
 	/* read at least 1 byte, no more than SPIDEV_MAXPATH */
 	if (len < 1)
@@ -401,35 +456,17 @@ MAX3100_readbytes(MAX3100_Object *self, PyObject *args, PyObject *kwds)
 	else if ((unsigned)len > sizeof(rxbuf))
 		len = sizeof(rxbuf);
 
-  int len1=0;
+	int ii = 0;
 	memset(rxbuf, 0, sizeof rxbuf);
-	struct timeval stoptime;
-	then(&stoptime,timeout);
-	int stop = 0;
-	for (ii = 0; ii < len; ii++) {
-		while (!readbyte(self, &(rxbuf[ii]))) {
-			 stop = stopnow(&stoptime);
-			 if (stop) {
-			   break;
-			 }
+	while (ii < len) {
+		if (getbyte(self, &(rxbuf[ii]))) {
+	    ii++;
 		}
-		if (stop) {
-			// fprintf(stderr, "STOP\n");
-			break;
-		}
-		// fprintf(stderr, "  %d %c\n", ii, rxbuf[ii]);
-		len1++;
-		then(&stoptime,timeout);
 	}
-	// fprintf(stderr, "len1: %d\n", len1);
-	// if (stop || (len1 < len)) {
-	// 	PyErr_SetString(PyExc_ValueError, wrmsg_timeout);
-	// 	return NULL;
-	// }
 	
-	list = PyList_New(len1);
+	list = PyList_New(len);
 
-	for (ii = 0; ii < len1; ii++) {
+	for (ii = 0; ii < len; ii++) {
 		PyObject *val = PyLong_FromLong((long)rxbuf[ii]);
 		PyList_SET_ITEM(list, ii, val);  // Steals reference, no need to Py_DECREF(val)
 	}
@@ -450,7 +487,7 @@ MAX3100_fileno(MAX3100_Object *self)
 }
 
 PyDoc_STRVAR(MAX3100_open_doc,
-	"open(bus=0, device=0, crystal=2, baud=9600, spispeed=7800000)\n\n"
+	"open(bus=0, device=0, crystal=2, baud=9600, spispeed=3900000, maxmisses=3)\n\n"
 	"Connects the object to the specified SPI device.\n"
 	"open(X,Y,...) will open /dev/spidev<X>.<Y>\n");
 
@@ -462,12 +499,13 @@ MAX3100_open(MAX3100_Object *self, PyObject *args, PyObject *kwds)
 	int crystal=2;
 	int baud=9600;
 	int spispeed = 3900000;
+	int maxmisses = 3;
 	char path[SPIDEV_MAXPATH];
 	uint8_t tmp8;
 	//uint32_t tmp32;
-	static char *kwlist[] = {"bus", "device", "crystal", "baud", "spispeed", NULL};
-	if (!PyArg_ParseTupleAndKeywords(args, kwds, "|iiiii:open", kwlist, 
-	                                 &bus, &device, &crystal, &baud, &spispeed))
+	static char *kwlist[] = {"bus", "device", "crystal", "baud", "spispeed", "maxmisses", NULL};
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "|iiiiii:open", kwlist, 
+	                                 &bus, &device, &crystal, &baud, &spispeed, &maxmisses))
 		return NULL;
 	if (snprintf(path, SPIDEV_MAXPATH, "/dev/spidev%d.%d", bus, device) >= SPIDEV_MAXPATH) {
 		PyErr_SetString(PyExc_OverflowError,
@@ -498,6 +536,7 @@ MAX3100_open(MAX3100_Object *self, PyObject *args, PyObject *kwds)
 		return NULL;
 	}
 	self->max_speed_hz = spispeed_;
+	self->maxmisses = maxmisses;
 
   uint16_t conf;
   if (crystal == 2)
@@ -549,10 +588,11 @@ MAX3100_init(MAX3100_Object *self, PyObject *args, PyObject *kwds)
 	int crystal = -1;
 	int baud = -1;
 	int spispeed = -1;
-	static char *kwlist[] = {"bus", "client", "crystal", "baud", "spispeed", NULL};
+	int maxmisses = -1;
+	static char *kwlist[] = {"bus", "client", "crystal", "baud", "spispeed", "maxmisses", NULL};
 
-	if (!PyArg_ParseTupleAndKeywords(args, kwds, "|iiiii:__init__",
-			kwlist, &bus, &client, &crystal, &baud, &spispeed))
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "|iiiiii:__init__",
+			kwlist, &bus, &client, &crystal, &baud, &spispeed, &maxmisses))
 		return -1;
 
 	if (bus >= 0) {
@@ -566,7 +606,7 @@ MAX3100_init(MAX3100_Object *self, PyObject *args, PyObject *kwds)
 
 
 PyDoc_STRVAR(MAX3100_ObjectType_doc,
-	"MAX3100([bus],[client],[crystal],[baud],[spispeed]) -> Serial\n\n"
+	"MAX3100([bus],[client],[crystal],[baud],[spispeed],[maxmisses]) -> Serial\n\n"
 	"Return a new MAX3100 object that is (optionally) connected to the\n"
 	"specified SPI device interface.\n");
 
