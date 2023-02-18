@@ -267,7 +267,7 @@ uint16_t transfer16(MAX3100_Object *self, uint16_t send) {
 
 void fetchbytes(MAX3100_Object *self) {
 	uint16_t r;
-	misses = 0
+	uint8_t misses = 0
 	while (misses < self->maxmisses) {
 		r = transfer16(self, MAX3100_CMD_READ_DATA);
 		if (r&MAX3100_CONF_R) {
