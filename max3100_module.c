@@ -272,7 +272,7 @@ void fetchbytes(MAX3100_Object *self) {
 		r = transfer16(self, MAX3100_CMD_READ_DATA);
 		if (r&MAX3100_CONF_R) {
 		  buffer[bufend] = (uint8_t)(r&0xff);
-		  bufend += 1
+		  bufend += 1;
 		  if (bufend >= BUFSIZE) {
 		    bufend = 0;
 		  }
@@ -284,7 +284,7 @@ void fetchbytes(MAX3100_Object *self) {
 	}
 }
 
-void putbyte(MAX3100_Object *self, uint8_t uch)) {
+void putbyte(MAX3100_Object *self, uint8_t uch) {
 	uint16_t r;
 	while (1) {
 		r = transfer16(self, MAX3100_CMD_READ_CONF);
@@ -297,7 +297,7 @@ void putbyte(MAX3100_Object *self, uint8_t uch)) {
 	r = transfer16(self,MAX3100_CMD_WRITE_DATA|uch);
 	if (r&MAX3100_CONF_R) {
 	  buffer[bufend] = (uint8_t)(r&0xff);
-	  bufend += 1
+	  bufend += 1;
 		if (bufend >= BUFSIZE) {
 		  bufend = 0;
 		}
@@ -306,13 +306,13 @@ void putbyte(MAX3100_Object *self, uint8_t uch)) {
 	}
 }
 
-uint8_t getbyte(MAX3100_Object *self, uint8_t &uch)) {
+uint8_t getbyte(MAX3100_Object *self, uint8_t *uch) {
 	if (bufend == bufst) {
 		fetchbytes(self);
 	}
 	if (bufend != bufst) {
-		*uch = buffer[bufst]
-		bufst += 1
+		*uch = buffer[bufst];
+		bufst += 1;
 		if (bufst >= BUFSIZE) {
 			bufst = 0;
 		}
@@ -456,8 +456,8 @@ MAX3100_readbytes(MAX3100_Object *self, PyObject *args, PyObject *kwds)
 	else if ((unsigned)len > sizeof(rxbuf))
 		len = sizeof(rxbuf);
 
-	int ii = 0;
 	memset(rxbuf, 0, sizeof rxbuf);
+	ii = 0;
 	while (ii < len) {
 		if (getbyte(self, &(rxbuf[ii]))) {
 	    ii++;
