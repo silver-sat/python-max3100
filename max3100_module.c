@@ -272,6 +272,7 @@ void fetchbytes(MAX3100_Object *self) {
 		r = transfer16(self, MAX3100_CMD_READ_DATA);
 		if (r&MAX3100_CONF_R) {
 		  buffer[bufend] = (uint8_t)(r&0xff);
+			// fprintf(stderr, "store - %04d: %02X\n", bufend, buffer[bufend]);
 		  bufend += 1;
 		  if (bufend >= BUFSIZE) {
 		    bufend = 0;
@@ -297,7 +298,8 @@ void putbyte(MAX3100_Object *self, uint8_t uch) {
 	r = transfer16(self,MAX3100_CMD_WRITE_DATA|uch);
 	if (r&MAX3100_CONF_R) {
 	  buffer[bufend] = (uint8_t)(r&0xff);
-	  bufend += 1;
+	  // fprintf(stderr, "store - %04d: %02X\n", bufend, buffer[bufend]);
+		bufend += 1;
 		if (bufend >= BUFSIZE) {
 		  bufend = 0;
 		}
@@ -310,6 +312,7 @@ uint8_t getbyte(MAX3100_Object *self, uint8_t *uch) {
 	fetchbytes(self);
 	if (bufend != bufst) {
 		*uch = buffer[bufst];
+		// fprintf(stderr, "get   - %04d: %02X\n", bufst, buffer[bufst]);
 		bufst += 1;
 		if (bufst >= BUFSIZE) {
 			bufst = 0;
@@ -482,8 +485,8 @@ MAX3100_readbytes(MAX3100_Object *self, PyObject *args, PyObject *kwds)
         break;
 			}				
 		}
+		len = ii;
 	}
-	len = ii;
 	
 	list = PyList_New(len);
 
@@ -673,10 +676,10 @@ static PyMethodDef MAX3100_methods[] = {
 		MAX3100_open_doc},
 	{"close", (PyCFunction)MAX3100_close, METH_NOARGS,
 		MAX3100_close_doc},
-	{"fileno", (PyCFunction)MAX3100_fileno, METH_NOARGS,
-		MAX3100_fileno_doc},
 	{"available", (PyCFunction)MAX3100_available, METH_NOARGS,
 		MAX3100_available_doc},
+	{"clear", (PyCFunction)MAX3100_clear, METH_NOARGS,
+		MAX3100_clear_doc},
 	{"read", (PyCFunction)MAX3100_readbytes, METH_VARARGS | METH_KEYWORDS,
 		MAX3100_read_doc},
 	{"write", (PyCFunction)MAX3100_writebytes, METH_VARARGS,

@@ -43,7 +43,8 @@ def max3100_thread(baud,length):
         b = makebytes(6)
         print("%4d characters (%s) to send (SPI)"%(len(b),b))
         max3100.write(b)
-        b = max3100.read(6)
+        time.sleep(0.0005)
+        b = max3100.read()
         print("%4d characters (%s) received (SPI)"%(len(b),bytes(b)))
         time.sleep(1)
 
