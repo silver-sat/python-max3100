@@ -307,9 +307,7 @@ void putbyte(MAX3100_Object *self, uint8_t uch) {
 }
 
 uint8_t getbyte(MAX3100_Object *self, uint8_t *uch) {
-	if (bufend == bufst) {
-		fetchbytes(self);
-	}
+	fetchbytes(self);
 	if (bufend != bufst) {
 		*uch = buffer[bufst];
 		bufst += 1;
@@ -319,6 +317,19 @@ uint8_t getbyte(MAX3100_Object *self, uint8_t *uch) {
 		return 1;
 	} 
 	return 0;
+}
+
+int available(MAX3100_Object *self) {
+  fetchbytes(self);
+	if (bufend < bufst) {
+		return (bufend+BUFSIZE-bufst);
+  }
+	return (bufend-bufst);
+}
+
+void clear(MAX3100_Object *self) {
+	fetchbytes(self);
+	bufst = bufend = 0;
 }
 
 uint8_t readbyte(MAX3100_Object *self, uint8_t *ch) {
@@ -373,7 +384,7 @@ static char *wrmsg_timeout = "Timeout.";
 
 PyDoc_STRVAR(MAX3100_write_doc,
 	"write([values]) -> None\n\n"
-	"Write bytes to SPI device.\n");
+	"Write bytes via the MAX3100.\n");
 
 
 
@@ -435,34 +446,44 @@ MAX3100_writebytes(MAX3100_Object *self, PyObject *args)
 }
 
 PyDoc_STRVAR(MAX3100_read_doc,
-	"read(length=1) -> [values]\n\n"
-	"Read len bytes from SPI device. timeout in seconds\n");
+	"read(length=0) -> [values]\n\n"
+	"Read length bytes from SPI device.\n  length > 0, blocking read for length characters\n  length == 0, non-blocking read as many as possible (depends on maxmisses)\n  length < 0, non-blocking read for at most length characters (depends on maxmisses)\n");
 
 static PyObject *
 MAX3100_readbytes(MAX3100_Object *self, PyObject *args, PyObject *kwds)
 {
 	uint8_t	rxbuf[SPIDEV_MAXPATH];
 	int	ii;
-	int len=1;
+	int len=0;
 	
 	PyObject	*list;
   static char *kwlist[] = {"length", NULL};
 	if (!PyArg_ParseTupleAndKeywords(args, kwds, "|i:read", kwlist, &len))
 		return NULL;
 	
-	/* read at least 1 byte, no more than SPIDEV_MAXPATH */
-	if (len < 1)
-		len = 1;
-	else if ((unsigned)len > sizeof(rxbuf))
-		len = sizeof(rxbuf);
+	int blocking=1;
+	if (len <= 0) {
+		blocking = 0;
+		len = -len;
+	}
 
 	memset(rxbuf, 0, sizeof rxbuf);
 	ii = 0;
-	while (ii < len) {
-		if (getbyte(self, &(rxbuf[ii]))) {
-	    ii++;
+	if (blocking) {
+	  while (ii < len) {
+		  if (getbyte(self, &(rxbuf[ii]))) {
+	      ii++;
+		  }
+		}
+	} else {
+		while (getbyte(self, &(rxbuf[ii]))) {
+			ii++;
+      if (len > 0 && ii == len) {
+        break;
+			}				
 		}
 	}
+	len = ii;
 	
 	list = PyList_New(len);
 
@@ -474,17 +495,28 @@ MAX3100_readbytes(MAX3100_Object *self, PyObject *args, PyObject *kwds)
 	return list;
 }
 
-PyDoc_STRVAR(MAX3100_fileno_doc,
-	"fileno() -> integer \"file descriptor\"\n\n"
-	"This is needed for lower-level file interfaces, such as os.read().\n");
+PyDoc_STRVAR(MAX3100_available_doc,
+	"available() -> number of characters currently available to read\n");
 
 static PyObject *
-MAX3100_fileno(MAX3100_Object *self)
+MAX3100_available(MAX3100_Object *self)
 {
-	PyObject *result = Py_BuildValue("i", self->fd);
+	PyObject *result = Py_BuildValue("i", available(self));
 	Py_INCREF(result);
 	return result;
 }
+
+PyDoc_STRVAR(MAX3100_clear_doc,
+	"clear() -> flush all yet to be read characters\n");
+
+static PyObject *
+MAX3100_clear(MAX3100_Object *self)
+{
+	clear(self);
+	Py_INCREF(Py_None);
+	return Py_None;
+}
+
 
 PyDoc_STRVAR(MAX3100_open_doc,
 	"open(bus=0, device=0, crystal=2, baud=9600, spispeed=3900000, maxmisses=3)\n\n"
@@ -643,6 +675,8 @@ static PyMethodDef MAX3100_methods[] = {
 		MAX3100_close_doc},
 	{"fileno", (PyCFunction)MAX3100_fileno, METH_NOARGS,
 		MAX3100_fileno_doc},
+	{"available", (PyCFunction)MAX3100_available, METH_NOARGS,
+		MAX3100_available_doc},
 	{"read", (PyCFunction)MAX3100_readbytes, METH_VARARGS | METH_KEYWORDS,
 		MAX3100_read_doc},
 	{"write", (PyCFunction)MAX3100_writebytes, METH_VARARGS,
