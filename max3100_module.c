@@ -25,6 +25,8 @@
  * SOFTWARE.
  */
 
+#define PY_SSIZE_T_CLEAN int
+
 #include <Python.h>
 #include "structmember.h"
 #include <stdlib.h>
@@ -38,14 +40,7 @@
 
 #define _VERSION_ "0.1"
 #define SPIDEV_MAXPATH 4096
-
-#define BLOCK_SIZE_CONTROL_FILE "/sys/module/spidev/parameters/bufsiz"
-// The xfwr3 function attempts to use large blocks if /sys/module/spidev/parameters/bufsiz setting allows it.
-// However where we cannot get a value from that file, we fall back to this safe default.
-#define XFER3_DEFAULT_BLOCK_SIZE SPIDEV_MAXPATH
-// Largest block size for xfer3 - even if /sys/module/spidev/parameters/bufsiz allows bigger
-// blocks, we won't go above this value. As I understand, DMA is not used for anything bigger so why bother.
-#define XFER3_MAX_BLOCK_SIZE 65535
+#define BUFSIZE 8192
 
 // MAX3100 16-bit constants
 //
@@ -121,39 +116,6 @@
 #define PyInt_Type			PyLong_Type
 #endif
 
-// Maximum block size for xfer3
-// Initialised once by get_xfer3_block_size
-uint32_t xfer3_block_size = 0;
-
-// Read maximum block size from the /sys/module/spidev/parameters/bufsiz
-// In case of any problems reading the number, we fall back to XFER3_DEFAULT_BLOCK_SIZE.
-// If number is read ok but it exceeds the XFER3_MAX_BLOCK_SIZE, it will be capped to that value.
-// The value is read and cached on the first invocation. Following invocations just return the cached one.
-uint32_t get_xfer3_block_size(void) {
-	int value;
-
-	// If value was already initialised, just use it
-	if (xfer3_block_size != 0) {
-		return xfer3_block_size;
-	}
-
-	// Start with the default
-	xfer3_block_size = XFER3_DEFAULT_BLOCK_SIZE;
-
-	FILE *file = fopen(BLOCK_SIZE_CONTROL_FILE,"r");
-	if (file != NULL) {
-		if (fscanf(file, "%d", &value) == 1 && value > 0) {
-			if (value <= XFER3_MAX_BLOCK_SIZE) {
-				xfer3_block_size = value;
-			} else {
-				xfer3_block_size = XFER3_MAX_BLOCK_SIZE;
-			}
-		}
-		fclose(file);
-	}
-
-	return xfer3_block_size;
-}
 
 PyDoc_STRVAR(MAX3100_module_doc,
 	"This module defines an object type that allows serial communication\n"
@@ -175,13 +137,12 @@ typedef struct {
 	uint32_t max_speed_hz;	/* current SPI max speed setting in Hz */
 	uint8_t read0;	/* read 0 bytes after transfer to lwoer CS if SPI_CS_HIGH */
 	uint8_t maxmisses;
+	uint8_t buffer[BUFSIZE];
+	/* good read chars go from bufst ... (bufend-1), 
+	   buffer is empty if bufend == bufst */
+	uint32_t bufst;
+	uint32_t bufend;
 } MAX3100_Object;
-
-#define BUFSIZE 2048
-uint8_t buffer[BUFSIZE];
-/* good read chars go from bufst ... (bufend-1), buffer is empty if bufend == bufst */
-uint32_t bufst=0;
-uint32_t bufend=0;
 
 static PyObject *
 MAX3100_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
@@ -194,6 +155,8 @@ MAX3100_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
 	self->mode = 0;
 	self->bits_per_word = 0;
 	self->max_speed_hz = 0;
+	self->bufst=0;
+	self->bufend=0;
 	
 	Py_INCREF(self);
 	return (PyObject *)self;
@@ -233,20 +196,6 @@ uint16_t swapbytes(uint16_t data) {
 	return ((data << 8) & 0xff00) | ((data >> 8) & 0x00ff);
 }
 
-void send16(int fd, uint16_t send) {
-	// fprintf_binary(stderr, "send", send);
-	send = swapbytes(send);
-  write(fd, &send, sizeof(uint16_t));
-}
-
-uint16_t recv16(int fd) {
-	uint16_t recv=0;
-	read(fd, &recv, sizeof(uint16_t));
-	recv = swapbytes(recv);
-	// fprintf_binary(stderr, "recv", recv);
-	return recv;
-}
-	
 uint16_t transfer16(MAX3100_Object *self, uint16_t send) {
 	uint16_t recv=0;
 	// fprintf_binary(stderr, "send", send);
@@ -259,7 +208,7 @@ uint16_t transfer16(MAX3100_Object *self, uint16_t send) {
 	xfer.delay_usecs = 0;
 	xfer.speed_hz = self->max_speed_hz;
 	xfer.bits_per_word = self->bits_per_word;
-	int status = ioctl(self->fd, SPI_IOC_MESSAGE(1), &xfer);
+	ioctl(self->fd, SPI_IOC_MESSAGE(1), &xfer);
 	recv = swapbytes(recv);
 	// fprintf_binary(stderr, "recv", recv);
 	return recv;
@@ -271,13 +220,13 @@ void fetchbytes(MAX3100_Object *self) {
 	while (misses < self->maxmisses) {
 		r = transfer16(self, MAX3100_CMD_READ_DATA);
 		if (r&MAX3100_CONF_R) {
-		  buffer[bufend] = (uint8_t)(r&0xff);
+		  self->buffer[self->bufend] = (uint8_t)(r&0xff);
 			// fprintf(stderr, "store - %04d: %02X\n", bufend, buffer[bufend]);
-		  bufend += 1;
-		  if (bufend >= BUFSIZE) {
-		    bufend = 0;
+		  self->bufend += 1;
+		  if (self->bufend >= BUFSIZE) {
+		    self->bufend = 0;
 		  }
-			assert(bufend != bufst);
+			assert(self->bufend != self->bufst);
 			misses = 0;
 		} else {
 			misses += 1;
@@ -297,25 +246,25 @@ void putbyte(MAX3100_Object *self, uint8_t uch) {
 	}
 	r = transfer16(self,MAX3100_CMD_WRITE_DATA|uch);
 	if (r&MAX3100_CONF_R) {
-	  buffer[bufend] = (uint8_t)(r&0xff);
+	  self->buffer[self->bufend] = (uint8_t)(r&0xff);
 	  // fprintf(stderr, "store - %04d: %02X\n", bufend, buffer[bufend]);
-		bufend += 1;
-		if (bufend >= BUFSIZE) {
-		  bufend = 0;
+		self->bufend += 1;
+		if (self->bufend >= BUFSIZE) {
+		  self->bufend = 0;
 		}
-		assert(bufend != bufst);
+		assert(self->bufend != self->bufst);
 		fetchbytes(self);
 	}
 }
 
 uint8_t getbyte(MAX3100_Object *self, uint8_t *uch) {
 	fetchbytes(self);
-	if (bufend != bufst) {
-		*uch = buffer[bufst];
+	if (self->bufend != self->bufst) {
+		*uch = self->buffer[self->bufst];
 		// fprintf(stderr, "get   - %04d: %02X\n", bufst, buffer[bufst]);
-		bufst += 1;
-		if (bufst >= BUFSIZE) {
-			bufst = 0;
+		self->bufst += 1;
+		if (self->bufst >= BUFSIZE) {
+			self->bufst = 0;
 		}
 		return 1;
 	} 
@@ -324,72 +273,24 @@ uint8_t getbyte(MAX3100_Object *self, uint8_t *uch) {
 
 int available(MAX3100_Object *self) {
   fetchbytes(self);
-	if (bufend < bufst) {
-		return (bufend+BUFSIZE-bufst);
+	if (self->bufend < self->bufst) {
+		return (self->bufend+BUFSIZE-self->bufst);
   }
-	return (bufend-bufst);
+	return (self->bufend-self->bufst);
 }
 
 void clear(MAX3100_Object *self) {
 	fetchbytes(self);
-	bufst = bufend = 0;
-}
-
-uint8_t readbyte(MAX3100_Object *self, uint8_t *ch) {
-  uint16_t r = transfer16(self, MAX3100_CMD_READ_DATA);
-  if (r&MAX3100_CONF_R) {
-     (*ch) = (uint8_t)(r&0xff);
-		 return (uint8_t)1;
-	} else {
-    return (uint8_t)0;
-  }
-}
-
-uint16_t ready(MAX3100_Object *self) {
-	uint16_t r = transfer16(self, MAX3100_CMD_READ_CONF);
-  return (r&MAX3100_CONF_R);
-}
-
-uint16_t busy(MAX3100_Object *self) {
-	uint16_t r = transfer16(self, MAX3100_CMD_READ_CONF);
-	// fprintf_binary(stderr, "busy", r&MAX3100_CONF_T);
-	return (!(r&MAX3100_CONF_T));
-}
-
-void writebyte(MAX3100_Object *self, uint8_t uch) {
-	while (1) {
-	  if (!busy(self)) {
-			transfer16(self,MAX3100_CMD_WRITE_DATA|uch);
-			break;
-		}
-	}
-}
-
-void then(struct timeval *tv, int usec) {
-	struct timeval tv0, tv1;
-	gettimeofday(&tv0,NULL);
-	tv1.tv_sec = usec/1000000;
-	tv1.tv_usec = usec%1000000;
-	timeradd(&tv0,&tv1,tv);
-}
-
-int stopnow(struct timeval *stoptime) {
-	struct timeval tv;
-	gettimeofday(&tv,NULL);
-	return (timercmp(&tv,stoptime,>));
+	self->bufst = self->bufend = 0;
 }
 
 static char *wrmsg_list0 = "Empty argument list.";
 static char *wrmsg_listmax = "Argument list size exceeds %d bytes.";
 static char *wrmsg_val = "Non-Int/Long value in arguments: %x.";
-// static char *wrmsg_oom = "Out of memory.";
-static char *wrmsg_timeout = "Timeout.";
 
 PyDoc_STRVAR(MAX3100_write_doc,
 	"write([values]) -> None\n\n"
 	"Write bytes via the MAX3100.\n");
-
-
 
 static PyObject *
 MAX3100_writebytes(MAX3100_Object *self, PyObject *args)
@@ -459,7 +360,7 @@ MAX3100_readbytes(MAX3100_Object *self, PyObject *args, PyObject *kwds)
 	int	ii;
 	int len=0;
 	
-	PyObject	*list;
+	// PyObject	*list;
   static char *kwlist[] = {"length", NULL};
 	if (!PyArg_ParseTupleAndKeywords(args, kwds, "|i:read", kwlist, &len))
 		return NULL;
@@ -488,14 +389,8 @@ MAX3100_readbytes(MAX3100_Object *self, PyObject *args, PyObject *kwds)
 		len = ii;
 	}
 	
-	list = PyList_New(len);
-
-	for (ii = 0; ii < len; ii++) {
-		PyObject *val = PyLong_FromLong((long)rxbuf[ii]);
-		PyList_SET_ITEM(list, ii, val);  // Steals reference, no need to Py_DECREF(val)
-	}
-
-	return list;
+	PyObject *val = Py_BuildValue("y#",rxbuf,len);
+	return val;
 }
 
 PyDoc_STRVAR(MAX3100_available_doc,
@@ -503,6 +398,14 @@ PyDoc_STRVAR(MAX3100_available_doc,
 
 static PyObject *
 MAX3100_available(MAX3100_Object *self)
+{
+	PyObject *result = Py_BuildValue("i", available(self));
+	Py_INCREF(result);
+	return result;
+}
+
+static PyObject *
+MAX3100_inwaiting(MAX3100_Object *self, void *closure)
 {
 	PyObject *result = Py_BuildValue("i", available(self));
 	Py_INCREF(result);
@@ -691,6 +594,12 @@ static PyMethodDef MAX3100_methods[] = {
 	{NULL},
 };
 
+static PyGetSetDef MAX3100_getset[] = {
+	{"in_waiting", (getter)MAX3100_inwaiting, NULL,
+			"number of characters waiting\n"},
+  {NULL},
+};
+
 static PyTypeObject MAX3100_ObjectType = {
 #if PY_MAJOR_VERSION >= 3
 	PyVarObject_HEAD_INIT(NULL, 0)
@@ -726,7 +635,7 @@ static PyTypeObject MAX3100_ObjectType = {
 	0,				/* tp_iternext */
 	MAX3100_methods,			/* tp_methods */
 	0,				/* tp_members */
-	0,			  /* tp_getset */
+	MAX3100_getset,			  /* tp_getset */
 	0,				/* tp_base */
 	0,				/* tp_dict */
 	0,				/* tp_descr_get */

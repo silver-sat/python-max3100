@@ -26,25 +26,15 @@ else:
 
 def send(s,values):
     print("Write:","%02d"%(len(values),),":"," ".join(map(lambda b: "%02X"%b,values)),file=sys.stderr)
-    s.clear()
     s.write(values)
     
-# def recv(s,length,timeout):
-#     giveup = time.time()+timeout
-#     while time.time() < giveup and s.available() < length:
-#         time.sleep(0.00001)
-#     bytes = s.read(-length)
-#     if len(bytes) > 0:
-#       print(" Read:",len(bytes),":"," ".join(map(lambda b: "%02X"%b,bytes)),file=sys.stderr)
-#     return bytes
-
 def recv(s):
     readString = b''
-    bytesToRead = s.available() # s.in_waiting
+    bytesToRead = s.in_waiting
     while bytesToRead > 0:
         readByte= s.read(1)
-        readString += bytes(readByte)
-        bytesToRead = s.available() # s.in_waiting
+        readString += readByte
+        bytesToRead = s.in_waiting
         time.sleep(0.00005)
     if len(readString) > 0:
         print(" Read:","%02d"%(len(readString),),":"," ".join(map(lambda b: "%02X"%b,readString)),file=sys.stderr)
