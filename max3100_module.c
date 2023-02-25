@@ -52,6 +52,7 @@
     
 // Configuration.
 #define MAX3100_CONF_R              0b1000000000000000
+#define MAX3100_CONF_R_SB           0b0000000010000000
 #define MAX3100_CONF_T              0b0100000000000000
 #define MAX3100_CONF_RM             0b0000110000000000
 
@@ -214,7 +215,7 @@ uint16_t transfer16(MAX3100_Object *self, uint16_t send) {
 	return recv;
 }
 
-void fetchbytes(MAX3100_Object *self) {
+void fetchbytes_old(MAX3100_Object *self) {
 	uint16_t r;
 	uint8_t misses = 0;
 	while (misses < self->maxmisses) {
@@ -231,6 +232,35 @@ void fetchbytes(MAX3100_Object *self) {
 		} else {
 			misses += 1;
 		}
+	}
+}
+
+void fetchbytes(MAX3100_Object *self) {
+	uint8_t n = 8;
+	uint16_t s[n];
+	uint16_t r[n];
+	uint8_t misses = 0;
+	struct spi_ioc_transfer xfer;
+	memset(&xfer, 0, sizeof(xfer));
+	xfer.tx_buf = (unsigned long)s;
+	xfer.rx_buf = (unsigned long)r;
+	xfer.len = n*2;
+	xfer.speed_hz = self->max_speed_hz;
+	xfer.bits_per_word = self->bits_per_word;
+	memset(s,0,n*sizeof(uint16_t));
+	while (misses < self->maxmisses) {
+		ioctl(self->fd, SPI_IOC_MESSAGE(1), &xfer);
+		for (int i=0; i<n; i++) {
+		  if (r[i]&MAX3100_CONF_R_SB) {
+		    self->buffer[self->bufend] = (uint8_t)(r[i]>>8);
+			  // fprintf(stderr, "store - %04d: %02X\n", self->bufend, self->buffer[self->bufend]);
+		    self->bufend = (self->bufend + 1)%BUFSIZE;
+			  assert(self->bufend != self->bufst);
+			  misses = 0;
+		  } else {
+			  misses += 1;
+		  }
+	  }
 	}
 }
 
@@ -425,7 +455,7 @@ MAX3100_clear(MAX3100_Object *self)
 
 
 PyDoc_STRVAR(MAX3100_open_doc,
-	"open(bus=0, device=0, crystal=2, baud=9600, spispeed=3900000, maxmisses=3)\n\n"
+	"open(bus=0, device=0, crystal=2, baud=9600, spispeed=7800000, maxmisses=3)\n\n"
 	"Connects the object to the specified SPI device.\n"
 	"open(X,Y,...) will open /dev/spidev<X>.<Y>\n");
 
@@ -436,7 +466,7 @@ MAX3100_open(MAX3100_Object *self, PyObject *args, PyObject *kwds)
 	int device=0;
 	int crystal=2;
 	int baud=9600;
-	int spispeed = 3900000;
+	int spispeed = 7800000;
 	int maxmisses = 3;
 	char path[SPIDEV_MAXPATH];
 	uint8_t tmp8;

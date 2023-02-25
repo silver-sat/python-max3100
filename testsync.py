@@ -17,7 +17,7 @@ usemax3100 = True
 
 if usemax3100:
   print("Initialize MAX3100 interface",file=sys.stderr)
-  s = max3100.MAX3100(0,0,baud=baud,maxmisses=10)
+  s = max3100.MAX3100(0,0,baud=baud,spispeed=7800000,maxmisses=20)
 else:
   print("Initialize serial interface",file=sys.stderr)
   s = serial.Serial("/dev/serial0",baud)
@@ -31,10 +31,8 @@ def send(s,values):
 def recv(s):
     readString = b''
     bytesToRead = s.in_waiting
-    while bytesToRead > 0:
-        readByte= s.read(1)
-        readString += readByte
-        bytesToRead = s.in_waiting
+    while s.in_waiting > 0:
+        readString += s.read()
         time.sleep(0.00005)
     if len(readString) > 0:
         print(" Read:","%02d"%(len(readString),),":"," ".join(map(lambda b: "%02X"%b,readString)),file=sys.stderr)
@@ -76,7 +74,7 @@ for i in range(60):
 
 if good:
     send(s,SYNCACK)
-    time.sleep(0.1)
+    time.sleep(0.01)
     send(s,BAUD_56000)
-    time.sleep(0.1)
+    time.sleep(0.01)
     received = recv(s)
