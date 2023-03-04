@@ -455,7 +455,7 @@ MAX3100_clear(MAX3100_Object *self)
 
 
 PyDoc_STRVAR(MAX3100_open_doc,
-	"open(bus=0, device=0, crystal=2, baud=9600, spispeed=7800000, maxmisses=3)\n\n"
+	"open(bus=0, device=0, crystal=2, baud=9600, spispeed=7800000, maxmisses=10)\n\n"
 	"Connects the object to the specified SPI device.\n"
 	"open(X,Y,...) will open /dev/spidev<X>.<Y>\n");
 
@@ -467,7 +467,7 @@ MAX3100_open(MAX3100_Object *self, PyObject *args, PyObject *kwds)
 	int crystal=2;
 	int baud=9600;
 	int spispeed = 7800000;
-	int maxmisses = 3;
+	int maxmisses = 10;
 	char path[SPIDEV_MAXPATH];
 	uint8_t tmp8;
 	//uint32_t tmp32;

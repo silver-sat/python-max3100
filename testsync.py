@@ -30,7 +30,6 @@ def send(s,values):
     
 def recv(s):
     readString = b''
-    bytesToRead = s.in_waiting
     while s.in_waiting > 0:
         readString += s.read()
         time.sleep(0.00005)
