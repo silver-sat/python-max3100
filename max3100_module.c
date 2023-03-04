@@ -215,7 +215,7 @@ uint16_t transfer16(MAX3100_Object *self, uint16_t send) {
 	return recv;
 }
 
-void fetchbytes_old(MAX3100_Object *self) {
+void fetchbytes(MAX3100_Object *self) {
 	uint16_t r;
 	uint8_t misses = 0;
 	while (misses < self->maxmisses) {
@@ -235,7 +235,7 @@ void fetchbytes_old(MAX3100_Object *self) {
 	}
 }
 
-void fetchbytes(MAX3100_Object *self) {
+void fetchbytes_new(MAX3100_Object *self) {
 	uint8_t n = 8;
 	uint16_t s[n];
 	uint16_t r[n];
